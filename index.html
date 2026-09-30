@@ -122,7 +122,7 @@
     try {
       await scanner.start(
         { facingMode: 'environment' },
-        { fps: 10, qrbox: (w, h) => { const m = Math.min(w, h); return { width: Math.floor(m * 0.9), height: Math.floor(m * 0.6) }; } },
+                { fps: 15, qrbox: (w, h) => { const s = Math.floor(Math.min(w, h) * 0.85); return { width: s, height: s }; }, videoConstraints: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } } },
         onScan, () => {}
       );
       showCameraButtons(true);
