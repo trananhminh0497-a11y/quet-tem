@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>Quét tem</title>
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 0; padding: 14px; background: #f4f6f8; color: #222; }
+    h2 { margin: 0 0 10px; }
+    h3 { margin: 18px 0 6px; font-size: 16px; }
+    input[type=text], input[type=password] { width: 100%; font-size: 17px; padding: 11px; border: 1px solid #bbb; border-radius: 10px; margin: 5px 0; }
+    #reader { width: 100%; background: #000; border-radius: 12px; overflow: hidden; margin: 8px 0; }
+    .row { display: flex; gap: 8px; margin: 6px 0; }
+    .btn { flex: 1; display: block; text-align: center; font-size: 17px; font-weight: 600; padding: 14px 8px;
+           border: none; border-radius: 12px; background: #1a73e8; color: #fff; cursor: pointer; }
+    .btn.gray { background: #5f6368; }
+    .btn.green { background: #188038; }
+    .btn:disabled { opacity: .5; }
+    .chk { display: flex; align-items: center; gap: 8px; font-size: 16px; margin: 8px 0; }
+    .chk input { width: 22px; height: 22px; }
+    #status { padding: 12px; border-radius: 10px; font-size: 16px; font-weight: 600; margin: 8px 0; min-height: 22px; word-break: break-all; }
+    #status.ok   { background: #e6f4ea; color: #137333; }
+    #status.warn { background: #fef7e0; color: #b06000; }
+    #status.err  { background: #fce8e6; color: #c5221f; }
+    #status.info { background: #e8f0fe; color: #1a73e8; }
+    #count { font-size: 14px; color: #555; }
+    table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 10px; overflow: hidden; font-size: 13px; }
+    td { padding: 7px 6px; border-bottom: 1px solid #eee; word-break: break-all; }
+    td:first-child { white-space: nowrap; color: #666; }
+  </style>
+</head>
+<body>
+  <h2>📦 Quét tem</h2>
+
+  <input type="text" id="user" placeholder="Tên người quét">
+  <input type="password" id="token" placeholder="Mã bảo mật" inputmode="numeric">
+
+  <div id="reader"></div>
+
+  <div class="row">
+    <button class="btn" id="btnStart">📷 Bật camera</button>
+    <button class="btn gray" id="btnStop" style="display:none">⏹ Tắt camera</button>
+    <label class="btn gray" for="file">🖼 Chụp ảnh tem</label>
+  </div>
+  <input type="file" id="file" accept="image/*" capture="environment" style="display:none">
+
+  <input type="text" id="code" placeholder="Mã quét được (hoặc nhập tay)">
+  <input type="text" id="note" placeholder="Ghi chú (tuỳ chọn, giữ nguyên cho các lần quét sau)">
+
+  <label class="chk"><input type="checkbox" id="auto" checked> Tự lưu ngay khi quét được</label>
+  <button class="btn green" id="btnSave">💾 Lưu vào Google Sheet</button>
+
+  <div id="status"></div>
+  <div id="count"></div>
+
+  <h3>Vừa quét gần đây</h3>
+  <table id="recent"></table>
+
+<script>
+  const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyqUvIHXDjXQsYimglV6u5c_bGrm_ZQ090RnZ7WHyoJ7qe_n8LHSnHuotUVpN06Fg-KoA/exec';
+
+  const $ = id => document.getElementById(id);
+  const F = Html5QrcodeSupportedFormats;
+  const scanner = new Html5Qrcode('reader', {
+    verbose: false,
+    formatsToSupport: [F.QR_CODE, F.CODE_128, F.CODE_39, F.CODE_93, F.EAN_13, F.EAN_8,
+                       F.UPC_A, F.UPC_E, F.ITF, F.CODABAR, F.DATA_MATRIX]
+  });
+
+  let lastCode = '', lastTime = 0, lastFormat = '', busy = false, audioCtx = null, sessionCount = 0;
+
+  // Nhớ tên và mã bảo mật trên máy này
+  ['user', 'token'].forEach(id => {
+    try { $(id).value = localStorage.getItem('scan_' + id) || ''; } catch (e) {}
+    $(id).addEventListener('change', () => { try { localStorage.setItem('scan_' + id, $(id).value); } catch (e) {} });
+  });
+
+  function setStatus(msg, type) { const s = $('status'); s.textContent = msg; s.className = type || ''; }
+
+  function initAudio() {
+    try { if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)(); audioCtx.resume(); } catch (e) {}
+  }
+  function beep(ok) {
+    try {
+      if (!audioCtx) return;
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.frequency.value = ok ? 1200 : 300; g.gain.value = 0.15;
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(); o.stop(audioCtx.currentTime + (ok ? 0.12 : 0.35));
+    } catch (e) {}
+  }
+
+  async function api(payload) {
+    payload.token = $('token').value.trim();
+    const res = await fetch(SCRIPT_URL, { method: 'POST', body: JSON.stringify(payload) });
+    const r = await res.json();
+    if (!r.ok) throw new Error(r.error || 'Lỗi không rõ');
+    return r;
+  }
+
+  function onScan(text, result) {
+    const now = Date.now();
+    if (busy) return;
+    if (text === lastCode && now - lastTime < 3000) return; // chống lưu trùng do camera đọc liên tục
+    lastCode = text; lastTime = now;
+    lastFormat = (result && result.result && result.result.format && result.result.format.formatName) || '';
+    $('code').value = text;
+    beep(true);
+    if ($('auto').checked) save();
+    else setStatus('Đã đọc mã — bấm "Lưu" để ghi vào Sheet', 'info');
+  }
+
+  function showCameraButtons(on) {
+    $('btnStart').style.display = on ? 'none' : 'block';
+    $('btnStop').style.display  = on ? 'block' : 'none';
+  }
+
+  $('btnStart').onclick = async () => {
+    initAudio();
+    try {
+      await scanner.start(
+        { facingMode: 'environment' },
+        { fps: 10, qrbox: (w, h) => { const m = Math.min(w, h); return { width: Math.floor(m * 0.9), height: Math.floor(m * 0.6) }; } },
+        onScan, () => {}
+      );
+      showCameraButtons(true);
+      setStatus('Đưa tem vào giữa khung', 'info');
+    } catch (e) {
+      setStatus('Không mở được camera (' + e + ')', 'err');
+    }
+  };
+
+  $('btnStop').onclick = async () => {
+    try { await scanner.stop(); } catch (e) {}
+    showCameraButtons(false);
+    setStatus('', '');
+  };
+
+  $('file').onchange = async (e) => {
+    initAudio();
+    const f = e.target.files[0];
+    if (!f) return;
+    if (scanner.isScanning) { try { await scanner.stop(); } catch (x) {} showCameraButtons(false); }
+    setStatus('Đang đọc mã trong ảnh...', 'info');
+    try {
+      const text = await scanner.scanFile(f, false);
+      lastCode = '';
+      onScan(text, null);
+    } catch (err) {
+      beep(false);
+      setStatus('Không đọc được mã trong ảnh. Chụp gần hơn, đủ sáng, tem không bị loá.', 'err');
+    }
+    e.target.value = '';
+  };
+
+  $('btnSave').onclick = () => { initAudio(); save(); };
+  $('code').addEventListener('keydown', e => { if (e.key === 'Enter') save(); });
+
+  async function save() {
+    const code = $('code').value.trim();
+    if (!code) { setStatus('Chưa có mã để lưu', 'err'); return; }
+    if (!$('token').value.trim()) { setStatus('Chưa nhập mã bảo mật', 'err'); return; }
+    busy = true; $('btnSave').disabled = true;
+    setStatus('Đang lưu...', 'info');
+    try {
+      const r = await api({ action: 'save', code: code, format: lastFormat,
+                            user: $('user').value.trim(), note: $('note').value.trim() });
+      sessionCount++;
+      $('count').textContent = 'Đã quét trong phiên này: ' + sessionCount + ' tem';
+      if (r.dup) { beep(false); setStatus('⚠ Mã này đã quét trước đó (dòng ' + r.dup + '), vẫn đã lưu thêm: ' + code, 'warn'); }
+      else setStatus('✔ Đã lưu: ' + code, 'ok');
+      $('code').value = ''; lastFormat = '';
+      loadRecent();
+    } catch (err) {
+      beep(false); setStatus('Lỗi khi lưu: ' + err.message, 'err');
+    } finally {
+      busy = false; $('btnSave').disabled = false;
+    }
+  }
+
+  async function loadRecent() {
+    if (!$('token').value.trim()) return;
+    try {
+      const r = await api({ action: 'recent' });
+      const t = $('recent'); t.innerHTML = '';
+      r.rows.forEach(row => {
+        const tr = t.insertRow();
+        tr.insertCell().textContent = row[0];
+        tr.insertCell().textContent = row[1];
+        tr.insertCell().textContent = row[3];
+      });
+    } catch (e) {}
+  }
+  loadRecent();
+</script>
+</body>
+</html>
